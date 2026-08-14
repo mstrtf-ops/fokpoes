@@ -45,6 +45,12 @@ val egrSet = setOf(
     "P0406", "P0409", "P040D", "P040E", "P1406"
 )
 
+// staleness window: if the last successful read is older than this, the
+// big panel won't claim a verdict
+const val FRESH_MS = 9000L
+
+data class LogEntry(val time: String, val text: String)
+
 data class WatchState(
     val connected: Boolean = false,
     val connecting: Boolean = false,
@@ -53,7 +59,10 @@ data class WatchState(
     val lastAction: String = "",
     val autoClear: Boolean = false,
     val autoReconnect: Boolean = true,
-    val pendingClear: List<String>? = null
+    val pendingClear: List<String>? = null,
+    val lastSeen: Long = 0L,
+    val showLog: Boolean = false,
+    val log: List<LogEntry> = emptyList()
 )
 
 class MainActivity : ComponentActivity() {
@@ -80,7 +89,9 @@ class MainActivity : ComponentActivity() {
                     onConfirmClear = { mgr?.confirmClearAll() },
                     onCancelClear = { mgr?.cancelClear() },
                     onAutoClear = { mgr?.setAutoClear(it) },
-                    onAutoReconnect = { mgr?.setAutoReconnect(it) }
+                    onAutoReconnect = { mgr?.setAutoReconnect(it) },
+                    onShowLog = { mgr?.setShowLog(it) },
+                    onClearLog = { mgr?.clearLog() }
                 )
             }
         }
@@ -113,8 +124,12 @@ class ObdManager(
     private val stLock = Any()
 
     @Volatile private var socket: BluetoothSocket? = null
+    @Volatile private var wantLink = false   // user intends to be connected
     private var autoJob: Job? = null
+    private var heartJob: Job? = null
     private var st = WatchState()
+
+    init { startHeartbeat() }
 
     private fun update(f: (WatchState) -> WatchState) {
         val ns = synchronized(stLock) { st = f(st); st }
@@ -123,11 +138,22 @@ class ObdManager(
 
     private fun now() = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
 
+    private fun logClear(codes: List<String>, auto: Boolean) {
+        if (codes.isEmpty()) return
+        val entry = LogEntry(now(), (if (auto) "auto-cleared " else "cleared ") + codes.joinToString(", "))
+        update { it.copy(log = (listOf(entry) + it.log).take(200)) }
+    }
+
     // ---- public actions ----
 
     fun toggleConnection() = scope.launch {
-        if (st.connected || st.connecting) disconnectNow()
-        else mutex.withLock { openLocked() }
+        if (st.connected || st.connecting) {
+            wantLink = false
+            disconnectNow()
+        } else {
+            wantLink = true
+            mutex.withLock { openLocked() }
+        }
     }
 
     fun readCodes() = scope.launch {
@@ -135,7 +161,7 @@ class ObdManager(
             if (!ensureOpen()) return@withLock
             val codes = readDtcsLocked()
             if (codes == null) update { it.copy(statusLine = "No response on read") }
-            else update { it.copy(codes = codes, statusLine = "Read ${now()}") }
+            else update { it.copy(codes = codes, lastSeen = System.currentTimeMillis(), statusLine = "Read ${now()}") }
         }
     }
 
@@ -143,8 +169,8 @@ class ObdManager(
         mutex.withLock {
             if (!ensureOpen()) return@withLock
             val codes = readDtcsLocked() ?: emptyList()
-            if (codes.isEmpty()) update { it.copy(codes = codes, statusLine = "No codes to clear") }
-            else update { it.copy(codes = codes, pendingClear = codes, statusLine = "Confirm clear") }
+            if (codes.isEmpty()) update { it.copy(codes = codes, lastSeen = System.currentTimeMillis(), statusLine = "No codes to clear") }
+            else update { it.copy(codes = codes, lastSeen = System.currentTimeMillis(), pendingClear = codes, statusLine = "Confirm clear") }
         }
     }
 
@@ -152,12 +178,15 @@ class ObdManager(
 
     fun confirmClearAll() = scope.launch {
         mutex.withLock {
+            val had = st.pendingClear ?: st.codes
             val ok = clearAllLocked()
+            if (ok) logClear(had, auto = false)
             val codes = readDtcsLocked() ?: emptyList()
             update {
                 it.copy(
                     pendingClear = null,
                     codes = codes,
+                    lastSeen = System.currentTimeMillis(),
                     lastAction = if (ok) "Cleared all ${now()}" else "Clear rejected ${now()}",
                     statusLine = if (codes.isEmpty()) "Cleared" else "Codes still present"
                 )
@@ -172,8 +201,14 @@ class ObdManager(
 
     fun setAutoReconnect(on: Boolean) = update { it.copy(autoReconnect = on) }
 
+    fun setShowLog(on: Boolean) = update { it.copy(showLog = on) }
+
+    fun clearLog() = update { it.copy(log = emptyList()) }
+
     fun shutdown() {
+        wantLink = false
         stopAutoLoop()
+        heartJob?.cancel()
         try { socket?.close() } catch (_: Exception) {}
         scope.cancel()
     }
@@ -205,7 +240,7 @@ class ObdManager(
             }
             socket = s
             initElm()
-            update { it.copy(connected = true, connecting = false, statusLine = "Connected") }
+            update { it.copy(connected = true, connecting = false, lastSeen = System.currentTimeMillis(), statusLine = "Connected") }
             true
         } catch (e: Exception) {
             try { socket?.close() } catch (_: Exception) {}
@@ -237,7 +272,7 @@ class ObdManager(
         update { it.copy(connected = false, connecting = false, autoClear = false, statusLine = "Disconnected") }
     }
 
-    // ---- obd ops (call with mutex held) ----
+    // ---- obd ops (mutex held) ----
 
     private suspend fun clearAllLocked(): Boolean {
         if (st.autoReconnect) reopenLocked()
@@ -301,7 +336,38 @@ class ObdManager(
         } catch (e: Exception) { "" }
     }
 
-    // ---- auto-clear loop ----
+    // ---- heartbeat: liveness + auto-reconnect ----
+
+    private fun startHeartbeat() {
+        heartJob = scope.launch {
+            while (true) {
+                delay(4000)
+                if (!wantLink) continue
+                // if a real op is running, skip this beat
+                if (mutex.tryLock()) {
+                    try {
+                        if (socket?.isConnected == true) {
+                            val r = cmd("ATRV")
+                            if (r.isBlank()) {
+                                // link is dead
+                                try { socket?.close() } catch (_: Exception) {}
+                                socket = null
+                                update { it.copy(connected = false, statusLine = "Link lost, retrying") }
+                            } else {
+                                update { it.copy(connected = true, lastSeen = System.currentTimeMillis()) }
+                            }
+                        } else {
+                            // not open but user wants it: try to reconnect
+                            update { it.copy(statusLine = "Searching for adapter") }
+                            openLocked()
+                        }
+                    } finally { mutex.unlock() }
+                }
+            }
+        }
+    }
+
+    // ---- auto-clear loop (clears ANY codes) ----
 
     private fun startAutoLoop() {
         if (autoJob?.isActive == true) return
@@ -311,13 +377,11 @@ class ObdManager(
                     if (ensureOpen()) {
                         val codes = readDtcsLocked()
                         if (codes != null) {
-                            val nonEgr = codes.any { it !in egrSet }
-                            update { it.copy(codes = codes) }
-                            if (codes.isNotEmpty() && !nonEgr) {
+                            update { it.copy(codes = codes, lastSeen = System.currentTimeMillis()) }
+                            if (codes.isNotEmpty()) {
                                 val ok = clearAllLocked()
-                                update {
-                                    it.copy(lastAction = if (ok) "Auto-cleared EGR ${now()}" else "Auto-clear rejected ${now()}")
-                                }
+                                if (ok) logClear(codes, auto = true)
+                                update { it.copy(lastAction = if (ok) "Auto-cleared ${now()}" else "Auto-clear rejected ${now()}") }
                             }
                         }
                     }
@@ -339,25 +403,25 @@ fun WatchScreen(
     onConfirmClear: () -> Unit,
     onCancelClear: () -> Unit,
     onAutoClear: (Boolean) -> Unit,
-    onAutoReconnect: (Boolean) -> Unit
+    onAutoReconnect: (Boolean) -> Unit,
+    onShowLog: (Boolean) -> Unit,
+    onClearLog: () -> Unit
 ) {
     val green = Color(0xFF22C55E); val amber = Color(0xFFF59E0B)
     val red = Color(0xFFEF4444); val grey = Color(0xFF475569); val blue = Color(0xFF3B82F6)
     val bg = Color(0xFF0A0E14)
 
-    val nonEgr = st.codes.any { it !in egrSet }
+    val fresh = st.connected && (System.currentTimeMillis() - st.lastSeen) < FRESH_MS
     val (word, sub, color) = when {
         st.connecting -> Triple("CONNECTING", "waiting for adapter", grey)
         !st.connected -> Triple("DISCONNECTED", "tap connect", grey)
+        !fresh -> Triple("LINK STALE", "re-checking adapter", grey)
         st.codes.isEmpty() -> Triple("ALL CLEAR", "no fault codes", green)
-        nonEgr -> Triple("CHECK ENGINE", st.codes.joinToString("   "), red)
-        else -> Triple("EGR PRESENT", st.codes.joinToString("   "), amber)
+        else -> Triple("CODES PRESENT", st.codes.joinToString("   "), amber)
     }
 
     Surface(color = bg, modifier = Modifier.fillMaxSize()) {
-        Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp)
-        ) {
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Box(Modifier.size(11.dp).clip(CircleShape).background(if (st.connected) green else grey))
                 Spacer(Modifier.width(8.dp))
@@ -414,17 +478,23 @@ fun WatchScreen(
                 ) { Text("CLEAR ALL", fontWeight = FontWeight.Bold) }
             }
 
+            Spacer(Modifier.height(10.dp))
+
+            OutlinedButton(
+                onClick = { onShowLog(true) },
+                modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(14.dp)
+            ) { Text("CLEAR LOG (${st.log.size})", fontWeight = FontWeight.Bold) }
+
             Spacer(Modifier.height(14.dp))
             HorizontalDivider(color = Color(0xFF1E293B))
             Spacer(Modifier.height(6.dp))
 
-            ToggleRow("Auto-clear EGR", "clears only when EGR is the sole code",
+            ToggleRow("Auto-clear", "clears any codes automatically",
                 st.autoClear, onAutoClear)
             ToggleRow("Auto reconnect on clear", "fresh connection before each clear",
                 st.autoReconnect, onAutoReconnect)
 
             Spacer(Modifier.height(18.dp))
-
             if (st.lastAction.isNotBlank())
                 Text(st.lastAction, color = Color(0xFF94A3B8), fontSize = 14.sp)
             Text("status: ${st.statusLine}", color = Color(0xFF475569), fontSize = 12.sp)
@@ -436,13 +506,29 @@ fun WatchScreen(
             onDismissRequest = onCancelClear,
             title = { Text("Clear all codes?") },
             text = {
-                Text(
-                    "This wipes every stored code plus readiness data, not just EGR.\n\nAbout to clear:\n" +
-                        (if (st.pendingClear.isEmpty()) "(none)" else st.pendingClear.joinToString("\n"))
-                )
+                Text("This wipes every stored code plus readiness data.\n\nAbout to clear:\n" +
+                    (if (st.pendingClear.isEmpty()) "(none)" else st.pendingClear.joinToString("\n")))
             },
             confirmButton = { TextButton(onClick = onConfirmClear) { Text("CLEAR ALL") } },
             dismissButton = { TextButton(onClick = onCancelClear) { Text("CANCEL") } }
+        )
+    }
+
+    if (st.showLog) {
+        AlertDialog(
+            onDismissRequest = { onShowLog(false) },
+            title = { Text("Clear log") },
+            text = {
+                if (st.log.isEmpty()) Text("No clears logged yet.")
+                else Column(Modifier.verticalScroll(rememberScrollState())) {
+                    st.log.forEach { e ->
+                        Text("${e.time}   ${e.text}", color = Color(0xFFCBD5E1), fontSize = 14.sp)
+                        Spacer(Modifier.height(6.dp))
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { onShowLog(false) }) { Text("CLOSE") } },
+            dismissButton = { TextButton(onClick = onClearLog) { Text("WIPE LOG") } }
         )
     }
 }
