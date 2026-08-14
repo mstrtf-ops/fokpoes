@@ -12,15 +12,13 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.darkColorScheme
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,30 +33,37 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
-import java.io.InputStream
-import java.io.OutputStream
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
+val egrSet = setOf(
+    "P0401", "P0402", "P0403", "P0404", "P0405",
+    "P0406", "P0409", "P040D", "P040E", "P1406"
+)
+
 data class WatchState(
     val connected: Boolean = false,
+    val connecting: Boolean = false,
     val codes: List<String> = emptyList(),
-    val nonEgr: Boolean = false,
+    val statusLine: String = "Tap Connect to start",
     val lastAction: String = "",
-    val statusLine: String = "Starting"
+    val autoClear: Boolean = false,
+    val autoReconnect: Boolean = true,
+    val pendingClear: List<String>? = null
 )
 
 class MainActivity : ComponentActivity() {
 
     private var state by mutableStateOf(WatchState())
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var watcher: ObdWatcher? = null
+    private var mgr: ObdManager? = null
 
     private val permLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startWatcher()
+            if (granted) init()
             else state = state.copy(statusLine = "Bluetooth permission needed")
         }
 
@@ -66,17 +71,27 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) { WatchScreen(state) }
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                WatchScreen(
+                    state,
+                    onToggleConn = { mgr?.toggleConnection() },
+                    onRead = { mgr?.readCodes() },
+                    onClear = { mgr?.requestClearAll() },
+                    onConfirmClear = { mgr?.confirmClearAll() },
+                    onCancelClear = { mgr?.cancelClear() },
+                    onAutoClear = { mgr?.setAutoClear(it) },
+                    onAutoReconnect = { mgr?.setAutoReconnect(it) }
+                )
+            }
         }
-        if (hasBtPerm()) startWatcher() else permLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+        if (hasPerm()) init() else permLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
     }
 
-    private fun startWatcher() {
-        watcher = ObdWatcher(applicationContext) { s -> runOnUiThread { state = s } }
-        watcher?.start(scope)
+    private fun init() {
+        mgr = ObdManager(applicationContext) { s -> runOnUiThread { state = s } }
     }
 
-    private fun hasBtPerm(): Boolean =
+    private fun hasPerm(): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
             ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
                 PackageManager.PERMISSION_GRANTED
@@ -84,112 +99,159 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        watcher?.stop()
-        scope.cancel()
+        mgr?.shutdown()
     }
 }
 
-class ObdWatcher(
+class ObdManager(
     private val context: Context,
     private val onState: (WatchState) -> Unit
 ) {
     private val SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-    private val POLL_MS = 4000L
-    private val MIN_CLEAR_MS = 15000L
-    private var lastClear = 0L
-    private var cur = WatchState()
-    private var job: Job? = null
-    @Volatile private var running = false
-    private var socket: BluetoothSocket? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mutex = Mutex()
+    private val stLock = Any()
 
-    // Common EGR-family codes. Confirm the real one on first connect and add if missing.
-    private val EGR = setOf(
-        "P0401", "P0402", "P0403", "P0404", "P0405", "P0406",
-        "P0409", "P040D", "P040E", "P1406"
-    )
+    @Volatile private var socket: BluetoothSocket? = null
+    private var autoJob: Job? = null
+    private var st = WatchState()
 
-    fun start(scope: CoroutineScope) {
-        running = true
-        job = scope.launch(Dispatchers.IO) { loop() }
+    private fun update(f: (WatchState) -> WatchState) {
+        val ns = synchronized(stLock) { st = f(st); st }
+        onState(ns)
     }
 
-    fun stop() { running = false; job?.cancel(); close() }
+    private fun now() = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
 
-    private fun emit(s: WatchState) { cur = s; onState(s) }
-    private fun close() { try { socket?.close() } catch (_: Exception) {} ; socket = null }
-    private fun now() = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+    // ---- public actions ----
+
+    fun toggleConnection() = scope.launch {
+        if (st.connected || st.connecting) disconnectNow()
+        else mutex.withLock { openLocked() }
+    }
+
+    fun readCodes() = scope.launch {
+        mutex.withLock {
+            if (!ensureOpen()) return@withLock
+            val codes = readDtcsLocked()
+            if (codes == null) update { it.copy(statusLine = "No response on read") }
+            else update { it.copy(codes = codes, statusLine = "Read ${now()}") }
+        }
+    }
+
+    fun requestClearAll() = scope.launch {
+        mutex.withLock {
+            if (!ensureOpen()) return@withLock
+            val codes = readDtcsLocked() ?: emptyList()
+            if (codes.isEmpty()) update { it.copy(codes = codes, statusLine = "No codes to clear") }
+            else update { it.copy(codes = codes, pendingClear = codes, statusLine = "Confirm clear") }
+        }
+    }
+
+    fun cancelClear() = update { it.copy(pendingClear = null, statusLine = "Clear cancelled") }
+
+    fun confirmClearAll() = scope.launch {
+        mutex.withLock {
+            val ok = clearAllLocked()
+            val codes = readDtcsLocked() ?: emptyList()
+            update {
+                it.copy(
+                    pendingClear = null,
+                    codes = codes,
+                    lastAction = if (ok) "Cleared all ${now()}" else "Clear rejected ${now()}",
+                    statusLine = if (codes.isEmpty()) "Cleared" else "Codes still present"
+                )
+            }
+        }
+    }
+
+    fun setAutoClear(on: Boolean) {
+        update { it.copy(autoClear = on) }
+        if (on) startAutoLoop() else stopAutoLoop()
+    }
+
+    fun setAutoReconnect(on: Boolean) = update { it.copy(autoReconnect = on) }
+
+    fun shutdown() {
+        stopAutoLoop()
+        try { socket?.close() } catch (_: Exception) {}
+        scope.cancel()
+    }
+
+    // ---- connection ----
 
     @SuppressLint("MissingPermission")
-    private suspend fun loop() {
+    private suspend fun openLocked(): Boolean {
         val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = bm?.adapter
-        while (running) {
-            if (adapter == null || !adapter.isEnabled) {
-                emit(cur.copy(connected = false, statusLine = "Turn on Bluetooth")); delay(3000); continue
+        if (adapter == null || !adapter.isEnabled) {
+            update { it.copy(connecting = false, statusLine = "Turn on Bluetooth") }; return false
+        }
+        val dev = adapter.bondedDevices.firstOrNull { d ->
+            d.name?.let { n ->
+                listOf("OBD", "ELM", "V-LINK", "VEEPEAK", "VIECAR", "VGATE").any { n.contains(it, true) }
+            } == true
+        }
+        if (dev == null) {
+            update { it.copy(connecting = false, statusLine = "Pair the OBD adapter first") }; return false
+        }
+        update { it.copy(connecting = true, statusLine = "Connecting to ${dev.name}") }
+        return try {
+            var s = dev.createRfcommSocketToServiceRecord(SPP)
+            try { s.connect() } catch (e: Exception) {
+                try { s.close() } catch (_: Exception) {}
+                s = dev.createInsecureRfcommSocketToServiceRecord(SPP)
+                s.connect()
             }
-            val dev = adapter.bondedDevices.firstOrNull { d ->
-                d.name?.let { n ->
-                    listOf("OBD", "ELM", "V-LINK", "VEEPEAK", "VIECAR", "VGATE").any { n.contains(it, true) }
-                } == true
-            }
-            if (dev == null) {
-                emit(cur.copy(connected = false, statusLine = "Pair the OBD adapter in Bluetooth settings"))
-                delay(4000); continue
-            }
-            try {
-                emit(cur.copy(connected = false, statusLine = "Connecting to ${dev.name}"))
-                var s = dev.createRfcommSocketToServiceRecord(SPP)
-                try { s.connect() } catch (e: Exception) {
-                    try { s.close() } catch (_: Exception) {}
-                    s = dev.createInsecureRfcommSocketToServiceRecord(SPP)
-                    s.connect()
-                }
-                socket = s
-                val out = s.outputStream; val inp = s.inputStream
-                init(out, inp)
-                emit(cur.copy(connected = true, statusLine = "Monitoring"))
-                monitor(out, inp)
-            } catch (e: Exception) {
-                emit(cur.copy(connected = false, statusLine = "Reconnecting"))
-            } finally { close() }
-            delay(2500)
+            socket = s
+            initElm()
+            update { it.copy(connected = true, connecting = false, statusLine = "Connected") }
+            true
+        } catch (e: Exception) {
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null
+            update { it.copy(connected = false, connecting = false, statusLine = "Connect failed") }
+            false
         }
     }
 
-    private suspend fun monitor(out: OutputStream, inp: InputStream) {
-        while (running) {
-            val codes = readDtcs(out, inp)
-            if (codes == null) {
-                emit(cur.copy(connected = true, statusLine = "No response, retrying")); delay(POLL_MS); continue
-            }
-            val nonEgr = codes.any { it !in EGR }
-            emit(cur.copy(connected = true, codes = codes, nonEgr = nonEgr, statusLine = "raw ok"))
-            val t = System.currentTimeMillis()
-            if (codes.isNotEmpty() && !nonEgr && t - lastClear > MIN_CLEAR_MS) {
-                val ok = clear(out, inp)
-                lastClear = t
-                emit(cur.copy(lastAction =
-                    if (ok) "Cleared ${codes.joinToString(",")} at ${now()}"
-                    else "Clear rejected at ${now()} (engine running?)"))
-            }
-            delay(POLL_MS)
+    private suspend fun ensureOpen(): Boolean {
+        if (socket?.isConnected == true) return true
+        return openLocked()
+    }
+
+    private suspend fun reopenLocked() {
+        update { it.copy(statusLine = "Reconnecting for clear") }
+        try { socket?.close() } catch (_: Exception) {}
+        socket = null
+        delay(700)
+        openLocked()
+    }
+
+    private suspend fun disconnectNow() {
+        stopAutoLoop()
+        mutex.withLock {
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null
         }
+        update { it.copy(connected = false, connecting = false, autoClear = false, statusLine = "Disconnected") }
     }
 
-    private fun init(out: OutputStream, inp: InputStream) {
-        cmd(out, inp, "ATZ"); Thread.sleep(1000)
-        cmd(out, inp, "ATE0")
-        cmd(out, inp, "ATL0")
-        cmd(out, inp, "ATH0")
-        cmd(out, inp, "ATSP0")
-        cmd(out, inp, "0100")
+    // ---- obd ops (call with mutex held) ----
+
+    private suspend fun clearAllLocked(): Boolean {
+        if (st.autoReconnect) reopenLocked()
+        if (socket?.isConnected != true && !openLocked()) return false
+        return cmd("04").replace(" ", "").uppercase().contains("44")
     }
 
-    private fun clear(out: OutputStream, inp: InputStream): Boolean =
-        cmd(out, inp, "04").replace(" ", "").uppercase().contains("44")
+    private fun initElm() {
+        cmd("ATZ"); Thread.sleep(1000)
+        cmd("ATE0"); cmd("ATL0"); cmd("ATH0"); cmd("ATSP0"); cmd("0100")
+    }
 
-    private fun readDtcs(out: OutputStream, inp: InputStream): List<String>? {
-        val resp = cmd(out, inp, "03")
+    private fun readDtcsLocked(): List<String>? {
+        val resp = cmd("03")
         val flat = resp.uppercase().replace(" ", "").replace("\r", "").replace("\n", "")
         if (flat.contains("NODATA")) return emptyList()
         val toks = tokenize(resp)
@@ -197,15 +259,15 @@ class ObdWatcher(
         if (i < 0) return null
         var data = toks.drop(i + 1)
         if (data.isEmpty()) return emptyList()
-        if (data.size % 2 == 1) data = data.drop(1)   // CAN count byte
-        val out2 = mutableListOf<String>()
+        if (data.size % 2 == 1) data = data.drop(1)
+        val out = mutableListOf<String>()
         var k = 0
         while (k + 1 < data.size) {
             val hi = data[k]; val lo = data[k + 1]
-            if (!(hi == "00" && lo == "00")) decode(hi, lo)?.let { out2.add(it) }
+            if (!(hi == "00" && lo == "00")) decode(hi, lo)?.let { out.add(it) }
             k += 2
         }
-        return out2.distinct()
+        return out.distinct()
     }
 
     private fun tokenize(s: String): List<String> =
@@ -222,11 +284,12 @@ class ObdWatcher(
         return "$letter$d1$d2${loHex.uppercase()}"
     }
 
-    private fun cmd(out: OutputStream, inp: InputStream, c: String): String {
+    private fun cmd(c: String): String {
+        val s = socket ?: return ""
         return try {
+            val out = s.outputStream; val inp = s.inputStream
             out.write((c + "\r").toByteArray()); out.flush()
-            val sb = StringBuilder()
-            val buf = ByteArray(512)
+            val sb = StringBuilder(); val buf = ByteArray(512)
             val start = System.currentTimeMillis()
             while (System.currentTimeMillis() - start < 4000) {
                 if (inp.available() > 0) {
@@ -237,74 +300,163 @@ class ObdWatcher(
             sb.toString()
         } catch (e: Exception) { "" }
     }
+
+    // ---- auto-clear loop ----
+
+    private fun startAutoLoop() {
+        if (autoJob?.isActive == true) return
+        autoJob = scope.launch {
+            while (st.autoClear) {
+                mutex.withLock {
+                    if (ensureOpen()) {
+                        val codes = readDtcsLocked()
+                        if (codes != null) {
+                            val nonEgr = codes.any { it !in egrSet }
+                            update { it.copy(codes = codes) }
+                            if (codes.isNotEmpty() && !nonEgr) {
+                                val ok = clearAllLocked()
+                                update {
+                                    it.copy(lastAction = if (ok) "Auto-cleared EGR ${now()}" else "Auto-clear rejected ${now()}")
+                                }
+                            }
+                        }
+                    }
+                }
+                delay(5000)
+            }
+        }
+    }
+
+    private fun stopAutoLoop() { autoJob?.cancel(); autoJob = null }
 }
 
 @Composable
-fun WatchScreen(st: WatchState) {
+fun WatchScreen(
+    st: WatchState,
+    onToggleConn: () -> Unit,
+    onRead: () -> Unit,
+    onClear: () -> Unit,
+    onConfirmClear: () -> Unit,
+    onCancelClear: () -> Unit,
+    onAutoClear: (Boolean) -> Unit,
+    onAutoReconnect: (Boolean) -> Unit
+) {
     val green = Color(0xFF22C55E); val amber = Color(0xFFF59E0B)
-    val red = Color(0xFFEF4444); val grey = Color(0xFF475569)
+    val red = Color(0xFFEF4444); val grey = Color(0xFF475569); val blue = Color(0xFF3B82F6)
     val bg = Color(0xFF0A0E14)
 
+    val nonEgr = st.codes.any { it !in egrSet }
     val (word, sub, color) = when {
-        !st.connected -> Triple(
-            if (st.statusLine.isBlank()) "CONNECTING" else st.statusLine.uppercase(),
-            "waiting for adapter", grey)
+        st.connecting -> Triple("CONNECTING", "waiting for adapter", grey)
+        !st.connected -> Triple("DISCONNECTED", "tap connect", grey)
         st.codes.isEmpty() -> Triple("ALL CLEAR", "no fault codes", green)
-        st.nonEgr -> Triple("CHECK ENGINE", st.codes.joinToString("   "), red)
-        else -> Triple("EGR AUTO CLEAR", st.codes.joinToString("   "), amber)
+        nonEgr -> Triple("CHECK ENGINE", st.codes.joinToString("   "), red)
+        else -> Triple("EGR PRESENT", st.codes.joinToString("   "), amber)
     }
-
-    val pulsing = st.connected && st.codes.isNotEmpty()
-    val infinite = rememberInfiniteTransition(label = "p")
-    val alpha by infinite.animateFloat(
-        initialValue = if (pulsing) 0.5f else 1f, targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "a")
 
     Surface(color = bg, modifier = Modifier.fillMaxSize()) {
         Column(
-            Modifier.fillMaxSize().padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp)
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
-            ) {
-                Box(Modifier.size(12.dp).clip(CircleShape)
-                    .background(if (st.connected) green else grey))
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Box(Modifier.size(11.dp).clip(CircleShape).background(if (st.connected) green else grey))
                 Spacer(Modifier.width(8.dp))
-                Text(if (st.connected) "ADAPTER LINKED" else "NO LINK",
-                    color = Color(0xFF94A3B8), fontSize = 13.sp, letterSpacing = 1.5.sp)
+                Text(if (st.connected) "LINKED" else "NO LINK",
+                    color = Color(0xFF94A3B8), fontSize = 12.sp, letterSpacing = 1.5.sp)
                 Spacer(Modifier.weight(1f))
-                Text("EGR WATCH", color = Color(0xFF64748B), fontSize = 13.sp,
+                Text("EGR WATCH", color = Color(0xFF64748B), fontSize = 12.sp,
                     fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
             }
 
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(18.dp))
 
             Box(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
-                    .background(color.copy(alpha = 0.16f))
-                    .padding(vertical = 48.dp, horizontal = 20.dp),
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp))
+                    .background(color.copy(alpha = 0.14f)).padding(vertical = 30.dp, horizontal = 18.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(word, color = color.copy(alpha = alpha),
-                        fontSize = 40.sp, fontWeight = FontWeight.Black,
-                        textAlign = TextAlign.Center, lineHeight = 44.sp)
-                    Spacer(Modifier.height(14.dp))
-                    Text(sub, color = Color(0xFFCBD5E1), fontSize = 20.sp,
-                        fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
+                    Text(word, color = color, fontSize = 32.sp, fontWeight = FontWeight.Black,
+                        textAlign = TextAlign.Center, lineHeight = 36.sp)
+                    Spacer(Modifier.height(10.dp))
+                    Text(sub, color = Color(0xFFCBD5E1), fontSize = 16.sp, textAlign = TextAlign.Center)
                 }
             }
 
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(18.dp))
+            Text("TOOLS", color = Color(0xFF64748B), fontSize = 12.sp,
+                fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+            Spacer(Modifier.height(10.dp))
 
-            Column(Modifier.fillMaxWidth()) {
-                if (st.lastAction.isNotBlank())
-                    Text(st.lastAction, color = Color(0xFF94A3B8), fontSize = 15.sp)
-                Spacer(Modifier.height(6.dp))
-                Text("status: ${st.statusLine}", color = Color(0xFF475569), fontSize = 12.sp)
+            Button(
+                onClick = onToggleConn,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = if (st.connected) grey else blue),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text(if (st.connected || st.connecting) "DISCONNECT" else "CONNECT",
+                    fontSize = 16.sp, fontWeight = FontWeight.Bold)
             }
+
+            Spacer(Modifier.height(10.dp))
+
+            Row(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = onRead, enabled = st.connected,
+                    modifier = Modifier.weight(1f).height(50.dp), shape = RoundedCornerShape(14.dp)
+                ) { Text("READ CODES", fontWeight = FontWeight.Bold) }
+                Spacer(Modifier.width(10.dp))
+                Button(
+                    onClick = onClear, enabled = st.connected,
+                    modifier = Modifier.weight(1f).height(50.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = red),
+                    shape = RoundedCornerShape(14.dp)
+                ) { Text("CLEAR ALL", fontWeight = FontWeight.Bold) }
+            }
+
+            Spacer(Modifier.height(14.dp))
+            HorizontalDivider(color = Color(0xFF1E293B))
+            Spacer(Modifier.height(6.dp))
+
+            ToggleRow("Auto-clear EGR", "clears only when EGR is the sole code",
+                st.autoClear, onAutoClear)
+            ToggleRow("Auto reconnect on clear", "fresh connection before each clear",
+                st.autoReconnect, onAutoReconnect)
+
+            Spacer(Modifier.height(18.dp))
+
+            if (st.lastAction.isNotBlank())
+                Text(st.lastAction, color = Color(0xFF94A3B8), fontSize = 14.sp)
+            Text("status: ${st.statusLine}", color = Color(0xFF475569), fontSize = 12.sp)
         }
+    }
+
+    if (st.pendingClear != null) {
+        AlertDialog(
+            onDismissRequest = onCancelClear,
+            title = { Text("Clear all codes?") },
+            text = {
+                Text(
+                    "This wipes every stored code plus readiness data, not just EGR.\n\nAbout to clear:\n" +
+                        (if (st.pendingClear.isEmpty()) "(none)" else st.pendingClear.joinToString("\n"))
+                )
+            },
+            confirmButton = { TextButton(onClick = onConfirmClear) { Text("CLEAR ALL") } },
+            dismissButton = { TextButton(onClick = onCancelClear) { Text("CANCEL") } }
+        )
+    }
+}
+
+@Composable
+fun ToggleRow(title: String, sub: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = Color(0xFFE2E8F0), fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            Text(sub, color = Color(0xFF64748B), fontSize = 12.sp)
+        }
+        Checkbox(checked = checked, onCheckedChange = onChange)
     }
 }
